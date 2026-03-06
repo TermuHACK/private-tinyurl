@@ -1,91 +1,176 @@
 import os
-import psycopg2
-import bcrypt
-from flask import Flask, request, redirect, render_template_string
+import shortuuid
+import psutil
+
+from flask import Flask,request,redirect,session
+from flask_sqlalchemy import SQLAlchemy
+from cryptography.fernet import Fernet
+
+# CONFIG
+
+DB_URL = os.getenv("DB_URL","postgresql://tiny:tiny@localhost/tinydb")
+ADMIN_PASS = os.getenv("ADMIN_PASS","admin")
+ENC_KEY = os.getenv("ENC_KEY")
+
+if not ENC_KEY:
+    ENC_KEY = Fernet.generate_key()
+else:
+    ENC_KEY = ENC_KEY.encode()
+
+fernet = Fernet(ENC_KEY)
+
+# APP
 
 app = Flask(__name__)
+app.secret_key="secret"
 
-DB_URL = os.getenv("DB_URL")
+app.config["SQLALCHEMY_DATABASE_URI"]=DB_URL
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"]=False
 
-conn = psycopg2.connect(DB_URL)
-cur = conn.cursor()
+db = SQLAlchemy(app)
 
-cur.execute("""
-CREATE TABLE IF NOT EXISTS links (
- id SERIAL PRIMARY KEY,
- code TEXT UNIQUE NOT NULL,
- target_url TEXT NOT NULL,
- password_hash TEXT NOT NULL
-)
-""")
+# MODEL
 
-conn.commit()
+class Link(db.Model):
 
+    id = db.Column(db.Integer,primary_key=True)
+    code = db.Column(db.String(10),unique=True)
+    url = db.Column(db.Text)
+    clicks = db.Column(db.Integer,default=0)
 
-login_html = """
-<h2>Access {{code}}</h2>
-<form method="post">
-<input type="password" name="password" placeholder="password">
-<button type="submit">Login</button>
-</form>
-"""
+# INIT DB
 
+with app.app_context():
+    db.create_all()
 
-@app.route("/create", methods=["GET","POST"])
-def create():
+# LOGIN
 
-    if request.method == "POST":
+@app.route("/",methods=["GET","POST"])
+def login():
 
-        code = request.form["code"]
-        url = request.form["url"]
-        password = request.form["password"]
-
-        pw_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
-
-        cur.execute(
-        "INSERT INTO links(code,target_url,password_hash) VALUES(%s,%s,%s)",
-        (code,url,pw_hash)
-        )
-
-        conn.commit()
-
-        return "created"
+    if request.method=="POST":
+        if request.form.get("password")==ADMIN_PASS:
+            session["auth"]=True
+            return redirect("/admin")
 
     return """
-    <h2>Create link</h2>
-    <form method="post">
-    code <input name="code"><br>
-    url <input name="url"><br>
-    password <input name="password"><br>
-    <button>Create</button>
+    <h2>TinyURL login</h2>
+    <form method=post>
+    <input type=password name=password placeholder=password>
+    <button>login</button>
     </form>
     """
 
+# ADMIN
 
-@app.route("/<code>", methods=["GET","POST"])
-def access(code):
+@app.route("/admin",methods=["GET","POST"])
+def admin():
 
-    if request.method == "GET":
-        return render_template_string(login_html, code=code)
+    if not session.get("auth"):
+        return redirect("/")
 
-    password = request.form["password"]
+    if request.method=="POST":
 
-    cur.execute(
-    "SELECT target_url,password_hash FROM links WHERE code=%s",
-    (code,)
-    )
+        url=request.form.get("url")
 
-    row = cur.fetchone()
+        code=shortuuid.ShortUUID().random(length=6)
 
-    if not row:
-        return "not found",404
+        enc=fernet.encrypt(url.encode()).decode()
 
-    url, pw_hash = row
+        link=Link(code=code,url=enc)
 
-    if not bcrypt.checkpw(password.encode(), pw_hash.encode()):
-        return "wrong password",403
+        db.session.add(link)
+        db.session.commit()
+
+    links=Link.query.all()
+
+    html="""
+
+    <h2>TinyURL admin</h2>
+
+    <form method=post>
+    <input name=url placeholder="url">
+    <button>shorten</button>
+    </form>
+
+    <h3>Links</h3>
+    """
+
+    for l in links:
+
+        url=fernet.decrypt(l.url.encode()).decode()
+
+        html+=f"""
+        <div>
+        <b>/{l.code}</b>
+        → {url}
+        | clicks: {l.clicks}
+        </div>
+        """
+
+    html+="""
+
+    <h3>Container stats</h3>
+
+    <canvas id=chart width=300 height=300></canvas>
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+    <script>
+
+    fetch('/stats')
+    .then(r=>r.json())
+    .then(d=>{
+
+        new Chart(document.getElementById('chart'),{
+
+            type:'doughnut',
+
+            data:{
+                labels:['CPU','RAM'],
+                datasets:[{
+                    data:[d.cpu,d.ram]
+                }]
+            }
+
+        })
+
+    })
+
+    </script>
+
+    """
+
+    return html
+
+# REDIRECT
+
+@app.route("/<code>")
+def go(code):
+
+    l=Link.query.filter_by(code=code).first()
+
+    if not l:
+        return "404"
+
+    l.clicks+=1
+    db.session.commit()
+
+    url=fernet.decrypt(l.url.encode()).decode()
 
     return redirect(url)
 
+# STATS
 
-app.run(host="0.0.0.0", port=8080)
+@app.route("/stats")
+def stats():
+
+    cpu=psutil.cpu_percent()
+    ram=psutil.virtual_memory().percent
+
+    return {"cpu":cpu,"ram":ram}
+
+# RUN
+
+if __name__=="__main__":
+    app.run(host="0.0.0.0",port=8080)
