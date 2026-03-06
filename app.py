@@ -5,43 +5,58 @@ import psutil
 from flask import Flask,request,redirect,session
 from flask_sqlalchemy import SQLAlchemy
 from cryptography.fernet import Fernet
+from werkzeug.security import generate_password_hash,check_password_hash
 
 # CONFIG
 
-DB_URL = os.getenv("DB_URL","postgresql://tiny:tiny@localhost/tinydb")
-ADMIN_PASS = os.getenv("ADMIN_PASS","admin")
-ENC_KEY = os.getenv("ENC_KEY")
+DB_URL=os.getenv("DB_URL","sqlite:///tiny.db")
+ENC_KEY=os.getenv("ENC_KEY")
 
 if not ENC_KEY:
-    ENC_KEY = Fernet.generate_key()
+    ENC_KEY=Fernet.generate_key()
 else:
-    ENC_KEY = ENC_KEY.encode()
+    ENC_KEY=ENC_KEY.encode()
 
-fernet = Fernet(ENC_KEY)
+fernet=Fernet(ENC_KEY)
 
-# APP
-
-app = Flask(__name__)
+app=Flask(__name__)
 app.secret_key="secret"
 
 app.config["SQLALCHEMY_DATABASE_URI"]=DB_URL
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"]=False
 
-db = SQLAlchemy(app)
+db=SQLAlchemy(app)
 
-# MODEL
+# MODELS
 
 class Link(db.Model):
 
-    id = db.Column(db.Integer,primary_key=True)
-    code = db.Column(db.String(10),unique=True)
-    url = db.Column(db.Text)
-    clicks = db.Column(db.Integer,default=0)
+    id=db.Column(db.Integer,primary_key=True)
+    code=db.Column(db.String(50),unique=True)
+    url=db.Column(db.Text)
+    clicks=db.Column(db.Integer,default=0)
 
-# INIT DB
+
+class Config(db.Model):
+
+    id=db.Column(db.Integer,primary_key=True)
+    password=db.Column(db.Text)
+
+
+# INIT
 
 with app.app_context():
+
     db.create_all()
+
+    if not Config.query.first():
+
+        p=os.getenv("ADMIN_PASS","admin")
+
+        c=Config(password=generate_password_hash(p))
+
+        db.session.add(c)
+        db.session.commit()
 
 # LOGIN
 
@@ -49,7 +64,13 @@ with app.app_context():
 def login():
 
     if request.method=="POST":
-        if request.form.get("password")==ADMIN_PASS:
+
+        password=request.form.get("password")
+
+        c=Config.query.first()
+
+        if check_password_hash(c.password,password):
+
             session["auth"]=True
             return redirect("/admin")
 
@@ -72,8 +93,10 @@ def admin():
     if request.method=="POST":
 
         url=request.form.get("url")
+        code=request.form.get("code")
 
-        code=shortuuid.ShortUUID().random(length=6)
+        if not code:
+            code=shortuuid.ShortUUID().random(length=6)
 
         enc=fernet.encrypt(url.encode()).decode()
 
@@ -88,12 +111,16 @@ def admin():
 
     <h2>TinyURL admin</h2>
 
+    <h3>Create link</h3>
+
     <form method=post>
     <input name=url placeholder="url">
-    <button>shorten</button>
+    <input name=code placeholder="custom endpoint (optional)">
+    <button>create</button>
     </form>
 
     <h3>Links</h3>
+
     """
 
     for l in links:
@@ -110,9 +137,21 @@ def admin():
 
     html+="""
 
+    <h3>Change password</h3>
+
+    <form method=post action="/password">
+
+    <input type=password name=new placeholder="new password">
+
+    <button>change</button>
+
+    </form>
+
     <h3>Container stats</h3>
 
-    <canvas id=chart width=300 height=300></canvas>
+    <div style="width:300px;height:300px">
+    <canvas id="chart"></canvas>
+    </div>
 
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
@@ -131,6 +170,10 @@ def admin():
                 datasets:[{
                     data:[d.cpu,d.ram]
                 }]
+            },
+
+            options:{
+                responsive:false
             }
 
         })
@@ -142,6 +185,26 @@ def admin():
     """
 
     return html
+
+
+# PASSWORD CHANGE
+
+@app.route("/password",methods=["POST"])
+def password():
+
+    if not session.get("auth"):
+        return redirect("/")
+
+    new=request.form.get("new")
+
+    c=Config.query.first()
+
+    c.password=generate_password_hash(new)
+
+    db.session.commit()
+
+    return redirect("/admin")
+
 
 # REDIRECT
 
@@ -160,6 +223,7 @@ def go(code):
 
     return redirect(url)
 
+
 # STATS
 
 @app.route("/stats")
@@ -169,6 +233,7 @@ def stats():
     ram=psutil.virtual_memory().percent
 
     return {"cpu":cpu,"ram":ram}
+
 
 # RUN
 
